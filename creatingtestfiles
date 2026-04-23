@@ -1,0 +1,161 @@
+import os
+import glob
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import nibabel as nib
+from tqdm import tqdm
+import sys
+
+# Zorg dat Python de MedSAM2 map kent
+sys.path.append(os.path.abspath('./MedSAM2/MedSAM2'))
+from sam2.build_sam import build_sam2
+from hydra import initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+
+# --- JOUW INSTELLINGEN ---
+CHECKPOINT_PATH = "best_medsam2_fold100epoch_0.pth" # Verander dit naar jouw beste model
+TEST_DATA_DIR = "./originele_data/testing/testing"   # De map met originele test .nii.gz bestanden
+OUTPUT_DIR = "./predictions"                # Hier komen je resultaten
+
+def setup_medsam2_for_testing():
+    GlobalHydra.instance().clear()
+    config_dir = os.path.abspath("./") 
+    with initialize_config_dir(version_base=None, config_dir=config_dir):
+        model = build_sam2("sam2.1_hiera_t512.yaml", "./MedSAM2/MedSAM2/checkpoints/sam2.1_hiera_tiny.pt")
+    
+    # NIEUW: Zet dit uit, net als tijdens de training!
+    try:
+        model.use_high_res_features_in_sam = False
+        model.sam_mask_decoder.use_high_res_features = False
+    except: pass
+
+    proj_layer = nn.Sequential(
+        nn.Conv2d(3, 16, kernel_size=3, padding=1),
+        nn.GELU(),
+        nn.BatchNorm2d(16),
+        nn.Conv2d(16, 4, kernel_size=1)
+    )
+    return model, proj_layer
+
+def predict_test_set():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 Start voorspellen op: {device}")
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # 1. Model laden
+    model, proj_layer = setup_medsam2_for_testing()
+    
+    checkpoint = torch.load(CHECKPOINT_PATH, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    proj_layer.load_state_dict(checkpoint['proj_layer_state_dict'])
+    
+    model.to(device)
+    proj_layer.to(device)
+    model.eval()
+    proj_layer.eval()
+
+   # 2. Zoek alle NIfTI bestanden, maar negeer de Ground Truths en 4D video's
+    all_niftis = sorted(glob.glob(os.path.join(TEST_DATA_DIR, "**", "*.nii.gz"), recursive=True))
+    test_files = [f for f in all_niftis if "_gt" not in f and "_4d" not in f]
+    
+    if len(test_files) == 0:
+        print(f"❌ Geen geldige testbestanden gevonden in {TEST_DATA_DIR}")
+        return
+
+    print(f"Gevonden beelden om te voorspellen: {len(test_files)}. Starten...")
+
+    with torch.no_grad():
+        for file_path in tqdm(test_files):
+            # A. Originele NIfTI inladen
+            nifti_img = nib.load(file_path)
+            # ACDC MRI's hebben vaak shape (X, Y, Z_slices) of (X, Y, Z_slices, T_time)
+            # We gaan ervanuit dat het al 3D volumes per time-frame zijn: (X, Y, Z)
+            data = nifti_img.get_fdata() 
+            affine = nifti_img.affine
+            header = nifti_img.header
+            
+            # Normaliseer intensiteiten per volume
+            data_min, data_max = data.min(), data.max()
+            if data_max > data_min:
+                data = (data - data_min) / (data_max - data_min)
+            
+            # B. Maak een leeg voorspellings-volume aan van exact dezelfde originele grootte
+            pred_volume = np.zeros(data.shape, dtype=np.uint8)
+            
+            # C. Voorspel slice voor slice (omdat SAM 2D is)
+            for z in range(data.shape[2]): # Loop over de Z-as (plakjes)
+                slice_2d = data[:, :, z]
+                
+                # Zorg dat het de juiste vorm krijgt voor SAM
+                slice_3c = np.stack((slice_2d, slice_2d, slice_2d), axis=0) # 3 kanalen (RGB)
+                img_t = torch.tensor(slice_3c, dtype=torch.float32).unsqueeze(0).to(device)
+                
+                # We moeten SAM's vereiste crop/zoom trukje toepassen!
+                _, _, h, w = img_t.shape
+                ch, cw = (256, 256)
+                th, tw = (512, 512)
+
+                # Padding
+                if h < ch or w < cw:
+                    pad_y, pad_x = max(0, ch - h), max(0, cw - w)
+                    padding = (pad_x // 2, pad_x - pad_x // 2, pad_y // 2, pad_y - pad_y // 2)
+                    img_t = F.pad(img_t, padding, mode='constant', value=0.0)
+                    _, _, h, w = img_t.shape
+                
+                # Crop & Zoom
+                y1, x1 = (h - ch) // 2, (w - cw) // 2
+                img_cropped = img_t[:, :, y1:y1+ch, x1:x1+cw]
+                img_zoomed = F.interpolate(img_cropped, size=(th, tw), mode="bilinear", align_corners=False)
+
+                # --- MODEL FORWARD ---
+                image_embeddings = model.image_encoder(img_zoomed)
+                sam_point_coords = torch.zeros(1, 1, 2, device=device)
+                sam_point_labels = -torch.ones(1, 1, dtype=torch.int32, device=device)
+                sparse_emb, dense_emb = model.sam_prompt_encoder(
+                    points=(sam_point_coords, sam_point_labels), boxes=None, masks=None
+                )
+                predicted_masks, _, _, _ = model.sam_mask_decoder(
+                    image_embeddings=image_embeddings["vision_features"],
+                    image_pe=model.sam_prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_emb,
+                    dense_prompt_embeddings=dense_emb,
+                    multimask_output=True, repeat_image=False, high_res_features=None,
+                )
+                logits = proj_layer(predicted_masks)
+                
+                # --- TERUGZETTEN NAAR ORIGINELE GROOTTE ---
+                # 1. Un-zoom
+                logits_unzoomed = F.interpolate(logits, size=(ch, cw), mode="bilinear", align_corners=False)
+                # 2. Harde klasses kiezen
+                pred_slice_cropped = torch.argmax(logits_unzoomed, dim=1).squeeze(0).cpu().numpy()
+                
+                # 3. Un-crop (Plaats het kleine 256x256 blokje terug in een gigantisch leeg zwart raster)
+                pred_slice_full = np.zeros((h, w), dtype=np.uint8)
+                pred_slice_full[y1:y1+ch, x1:x1+cw] = pred_slice_cropped
+                
+                # 4. Un-pad (Als we padding hadden toegevoegd, knip dat er nu weer af)
+                if img_t.shape[2] > data.shape[0] or img_t.shape[3] > data.shape[1]:
+                    orig_h, orig_w = data.shape[0], data.shape[1]
+                    py1 = (h - orig_h) // 2
+                    px1 = (w - orig_w) // 2
+                    pred_slice_full = pred_slice_full[py1:py1+orig_h, px1:px1+orig_w]
+
+                # D. Sla het plakje op in het 3D volume
+                pred_volume[:, :, z] = pred_slice_full
+
+              # E. Sla het hele 3D volume op als nieuw .nii.gz bestand
+            # Voeg expliciet '_gt' toe aan de naam, anders crasht metrics.py straks!
+            out_name = os.path.basename(file_path).replace(".nii.gz", "_gt.nii.gz")
+            out_path = os.path.join(OUTPUT_DIR, out_name)
+            
+            # CRUCIAAL: Gebruik de affine en header van de ground truth!
+            new_nifti = nib.Nifti1Image(pred_volume, affine=affine, header=header)
+            nib.save(new_nifti, out_path)
+
+    print("✅ Alle testbestanden voorspeld en opgeslagen!")
+
+if __name__ == "__main__":
+    predict_test_set()
